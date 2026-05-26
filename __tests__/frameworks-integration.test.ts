@@ -161,6 +161,55 @@ describe('C++ end-to-end — virtual override synthesis', () => {
     tmpDir = undefined;
   });
 
+  it('resolves callers through typed object pointers', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
+    let cg: CodeGraph | undefined;
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, 'detect.hpp'),
+        'class CDetect {\n' +
+          ' public:\n' +
+          '  int Processing();\n' +
+          '};\n' +
+          'class CDetector {\n' +
+          ' private:\n' +
+          '  CDetect* m_cpAlg = nullptr;\n' +
+          ' public:\n' +
+          '  int Run();\n' +
+          '  int Flush();\n' +
+          '};\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'detect.cpp'),
+        '#include "detect.hpp"\n' +
+          'int CDetector::Run() { return m_cpAlg->Processing(); }\n' +
+          'int CDetector::Flush() { return m_cpAlg->Processing(); }\n' +
+          'int CDetect::Processing() { return 0; }\n'
+      );
+
+      cg = CodeGraph.initSync(tmpDir);
+      await cg.indexAll();
+
+      const processing = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName.endsWith('CDetect::Processing'));
+      expect(processing).toBeDefined();
+
+      const callers = cg.getCallers(processing!.id).map((c) => c.node.qualifiedName);
+      expect(callers).toContain('CDetector::Run');
+      expect(callers).toContain('CDetector::Flush');
+
+      const runMethod = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName.endsWith('CDetector::Run'));
+      expect(runMethod).toBeDefined();
+      const callees = cg.getCallees(runMethod!.id).map((c) => c.node.qualifiedName);
+      expect(callees).toContain('CDetect::Processing');
+    } finally {
+      cg?.close();
+    }
+  });
+
   it('bridges a base virtual method to the subclass override', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
     fs.writeFileSync(
