@@ -338,6 +338,18 @@ export class FileWatcher {
 
     try {
       const result = await this.syncFn();
+      const madeNoProgress =
+        this.pendingFiles.size > 0 &&
+        result.filesChanged === 0 &&
+        result.durationMs === 0;
+
+      if (madeNoProgress) {
+        logDebug('Watch sync made no progress; retaining pending files for retry', {
+          pendingFiles: this.pendingFiles.size,
+        });
+        return;
+      }
+
       // Remove entries whose most recent event predates this sync — those
       // edits are now in the DB. Entries with lastSeenMs > syncStartedMs
       // arrived mid-sync; whether the in-flight sync captured them depends

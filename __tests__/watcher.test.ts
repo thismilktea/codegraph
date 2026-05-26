@@ -274,14 +274,40 @@ describe('FileWatcher', () => {
       const after = watcher.getPendingFiles();
       expect(after.some((p) => p.path === 'src/will-fail.ts')).toBe(true);
 
-      // Schedule a retry by emitting the event again (production would do
-      // this implicitly on the next file change; tests synthesize it).
-      triggerFileEvent(testDir, 'change', 'src/will-fail.ts');
-
-      // Retry resolves; entry clears.
+      // Retry resolves automatically; entry clears.
       await waitFor(
         () => !watcher.getPendingFiles().some((p) => p.path === 'src/will-fail.ts'),
       );
+
+      watcher.stop();
+    });
+
+    it('should retain pending files and retry when sync resolves with a zero-result no-op', async () => {
+      const syncFn = vi
+        .fn()
+        .mockResolvedValueOnce({ filesChanged: 0, durationMs: 0 })
+        .mockResolvedValueOnce({ filesChanged: 1, durationMs: 10 });
+      const onSyncComplete = vi.fn();
+      const watcher = new FileWatcher(testDir, syncFn, {
+        debounceMs: 100,
+        onSyncComplete,
+      });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      triggerFileEvent(testDir, 'add', 'src/locked.ts');
+
+      await waitFor(() => syncFn.mock.calls.length >= 1);
+      expect(watcher.getPendingFiles().some((p) => p.path === 'src/locked.ts')).toBe(true);
+      expect(onSyncComplete).not.toHaveBeenCalled();
+
+      await waitFor(() => syncFn.mock.calls.length >= 2);
+      await waitFor(
+        () => !watcher.getPendingFiles().some((p) => p.path === 'src/locked.ts'),
+      );
+
+      expect(onSyncComplete).toHaveBeenCalledTimes(1);
+      expect(onSyncComplete).toHaveBeenCalledWith({ filesChanged: 1, durationMs: 10 });
 
       watcher.stop();
     });
