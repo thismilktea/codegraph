@@ -9,6 +9,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **File watcher no longer marks edited files as fresh when another process holds the index lock.** When a second writer (concurrent `codegraph index`, a git hook, another MCP daemon) held `.codegraph/codegraph.lock`, `CodeGraph.sync()` returned a zero-shape no-op instead of throwing. The file watcher took that as a successful sync and cleared `pendingFiles` — so the per-file staleness signal MCP tools surface to agents (issue #403) dropped immediately, even though the edit was never indexed. `CodeGraph.watch()` now converts that no-op into a typed `LockUnavailableError` thrown into the watcher; the existing retry path preserves `pendingFiles` and reschedules until the lock becomes available. The error is logged at debug only (no `onSyncError` callback) so a long-running external indexer doesn't spam stderr every debounce cycle. Closes #449.
+
 ### Added
 - **Shared MCP daemon — running multiple AI agents in the same project no
   longer multiplies the file-watch, SQLite, and indexing cost.** Point more

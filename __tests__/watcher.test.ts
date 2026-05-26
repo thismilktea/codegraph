@@ -25,7 +25,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileWatcher } from '../src/sync/watcher';
+import { FileWatcher, LockUnavailableError } from '../src/sync/watcher';
 import CodeGraph from '../src/index';
 import { triggerFileEvent } from './__helpers__/chokidar-mock';
 
@@ -282,15 +282,21 @@ describe('FileWatcher', () => {
       watcher.stop();
     });
 
-    it('should retain pending files and retry when sync resolves with a zero-result no-op', async () => {
+    it('should retain pending files and retry when syncFn throws LockUnavailableError (#449)', async () => {
+      // CodeGraph.watch() converts the cross-process lock-failure no-op
+      // into LockUnavailableError so the watcher's retry path picks it up
+      // instead of falsely clearing pendingFiles. This test exercises the
+      // contract directly.
       const syncFn = vi
         .fn()
-        .mockResolvedValueOnce({ filesChanged: 0, durationMs: 0 })
+        .mockRejectedValueOnce(new LockUnavailableError())
         .mockResolvedValueOnce({ filesChanged: 1, durationMs: 10 });
       const onSyncComplete = vi.fn();
+      const onSyncError = vi.fn();
       const watcher = new FileWatcher(testDir, syncFn, {
         debounceMs: 100,
         onSyncComplete,
+        onSyncError,
       });
       watcher.start();
       await watcher.waitUntilReady();
@@ -299,6 +305,9 @@ describe('FileWatcher', () => {
 
       await waitFor(() => syncFn.mock.calls.length >= 1);
       expect(watcher.getPendingFiles().some((p) => p.path === 'src/locked.ts')).toBe(true);
+      // A held-lock no-op is not a sync failure — onSyncError stays quiet
+      // so a long-running external indexer doesn't spam stderr every cycle.
+      expect(onSyncError).not.toHaveBeenCalled();
       expect(onSyncComplete).not.toHaveBeenCalled();
 
       await waitFor(() => syncFn.mock.calls.length >= 2);
@@ -308,6 +317,7 @@ describe('FileWatcher', () => {
 
       expect(onSyncComplete).toHaveBeenCalledTimes(1);
       expect(onSyncComplete).toHaveBeenCalledWith({ filesChanged: 1, durationMs: 10 });
+      expect(onSyncError).not.toHaveBeenCalled();
 
       watcher.stop();
     });
