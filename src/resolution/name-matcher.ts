@@ -146,6 +146,114 @@ export function matchByQualifiedName(
   return null;
 }
 
+function resolveMethodOnType(
+  typeName: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  confidence: number,
+  resolvedBy: ResolvedRef['resolvedBy'],
+): ResolvedRef | null {
+  const classCandidates = context.getNodesByName(typeName);
+
+  for (const classNode of classCandidates) {
+    if (classNode.kind !== 'class' && classNode.kind !== 'struct' && classNode.kind !== 'interface') {
+      continue;
+    }
+    if (classNode.language !== ref.language) continue;
+
+    const nodesInFile = context.getNodesInFile(classNode.filePath);
+    const methodNode = nodesInFile.find(
+      (n) =>
+        n.kind === 'method' &&
+        n.name === methodName &&
+        n.qualifiedName.includes(classNode.name)
+    );
+
+    if (methodNode) {
+      return {
+        original: ref,
+        targetNodeId: methodNode.id,
+        confidence,
+        resolvedBy,
+      };
+    }
+  }
+
+  return null;
+}
+
+function normalizeCppTypeName(typeName: string): string | null {
+  const normalized = typeName
+    .replace(/\b(const|volatile|mutable|typename|class|struct)\b/g, ' ')
+    .replace(/[&*]+/g, ' ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!normalized) return null;
+  const parts = normalized.split(/::/).filter(Boolean);
+  return parts[parts.length - 1] ?? null;
+}
+
+function inferCppReceiverType(
+  receiverName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const source = context.readFile(ref.filePath);
+  if (!source) return null;
+
+  const lines = source.split(/\r?\n/);
+  const callLineIndex = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
+  const escapedReceiver = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const receiverPattern = new RegExp(`\\b${escapedReceiver}\\b`);
+
+  for (let i = callLineIndex; i >= 0; i--) {
+    const line = lines[i];
+    if (!line || !receiverPattern.test(line)) continue;
+
+    const declaratorMatch = line.match(
+      new RegExp(`([A-Za-z_][\\w:]*(?:\\s*<[^;=(){}]+>)?(?:\\s*[*&]+)?)\\s+${escapedReceiver}\\b`)
+    );
+    if (declaratorMatch) {
+      const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
+      if (normalized) return normalized;
+    }
+
+    const memberIndex = line.indexOf(receiverName);
+    if (memberIndex >= 0) {
+      const prefix = line.slice(0, memberIndex).trim();
+      const normalized = normalizeCppTypeName(prefix.replace(/\b(private|public|protected)\s*:?$/, '').trim());
+      if (normalized) return normalized;
+    }
+  }
+
+  const headerCandidates = [
+    ref.filePath.replace(/\.(?:c|cc|cpp|cxx)$/i, '.h'),
+    ref.filePath.replace(/\.(?:c|cc|cpp|cxx)$/i, '.hpp'),
+    ref.filePath.replace(/\.(?:c|cc|cpp|cxx)$/i, '.hxx'),
+  ].filter((candidate, index, arr) => arr.indexOf(candidate) === index && candidate !== ref.filePath);
+
+  for (const headerPath of headerCandidates) {
+    if (!context.fileExists(headerPath)) continue;
+    const headerSource = context.readFile(headerPath);
+    if (!headerSource) continue;
+
+    for (const line of headerSource.split(/\r?\n/)) {
+      if (!receiverPattern.test(line)) continue;
+      const declaratorMatch = line.match(
+        new RegExp(`([A-Za-z_][\\w:]*(?:\\s*<[^;=(){}]+>)?(?:\\s*[*&]+)?)\\s+${escapedReceiver}\\b`)
+      );
+      if (!declaratorMatch) continue;
+      const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
+      if (normalized) return normalized;
+    }
+  }
+
+  return null;
+}
+
 /**
  * Try to resolve by method name on a class/object
  */
@@ -163,6 +271,23 @@ export function matchMethodCall(
   }
 
   const [, objectOrClass, methodName] = match;
+
+  if (ref.language === 'cpp' && dotMatch) {
+    const inferredType = inferCppReceiverType(objectOrClass!, ref, context);
+    if (inferredType) {
+      const typedMatch = resolveMethodOnType(
+        inferredType,
+        methodName!,
+        ref,
+        context,
+        0.9,
+        'instance-method',
+      );
+      if (typedMatch) {
+        return typedMatch;
+      }
+    }
+  }
 
   // Strategy 1: Direct class name match (existing logic)
   const classCandidates = context.getNodesByName(objectOrClass!);
