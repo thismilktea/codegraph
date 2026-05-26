@@ -210,6 +210,62 @@ describe('C++ end-to-end — virtual override synthesis', () => {
     }
   });
 
+  it('resolves typed pointer callers when the method name is ambiguous and the call sits inside a return/declaration', async () => {
+    // Regression: an earlier version of the C++ receiver-type inference matched
+    // the call line itself (`return m_cpAlg->Processing()`) and treated `return`
+    // as the type, OR grabbed `int r =` as a type from the prefix. With Strategy
+    // 3's "unique method name" fallback, the original issue example resolved
+    // anyway — but as soon as two classes share a method name (very common in
+    // real C++), both calls go unresolved.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
+    let cg: CodeGraph | undefined;
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, 'detect.hpp'),
+        'class CDetect { public: int Processing(); };\n' +
+          'class CWidget { public: int Processing(); };\n' +
+          'class CDetector {\n' +
+          ' private:\n' +
+          '  CDetect* m_cpAlg = nullptr;\n' +
+          ' public:\n' +
+          '  int RunReturn();\n' +
+          '  int RunAssign();\n' +
+          '};\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'detect.cpp'),
+        '#include "detect.hpp"\n' +
+          'int CDetector::RunReturn() { return m_cpAlg->Processing(); }\n' +
+          'int CDetector::RunAssign() { int r = m_cpAlg->Processing(); return r; }\n' +
+          'int CDetect::Processing() { return 0; }\n' +
+          'int CWidget::Processing() { return 0; }\n'
+      );
+
+      cg = CodeGraph.initSync(tmpDir);
+      await cg.indexAll();
+
+      const detectProc = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName === 'CDetect::Processing');
+      const widgetProc = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName === 'CWidget::Processing');
+      expect(detectProc).toBeDefined();
+      expect(widgetProc).toBeDefined();
+
+      const detectCallers = cg.getCallers(detectProc!.id).map((c) => c.node.qualifiedName);
+      expect(detectCallers).toContain('CDetector::RunReturn');
+      expect(detectCallers).toContain('CDetector::RunAssign');
+
+      // CWidget::Processing is never called — calls must NOT misroute here.
+      const widgetCallers = cg.getCallers(widgetProc!.id).map((c) => c.node.qualifiedName);
+      expect(widgetCallers).not.toContain('CDetector::RunReturn');
+      expect(widgetCallers).not.toContain('CDetector::RunAssign');
+    } finally {
+      cg?.close();
+    }
+  });
+
   it('bridges a base virtual method to the subclass override', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
     fs.writeFileSync(

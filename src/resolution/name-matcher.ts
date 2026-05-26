@@ -154,26 +154,21 @@ function resolveMethodOnType(
   confidence: number,
   resolvedBy: ResolvedRef['resolvedBy'],
 ): ResolvedRef | null {
-  const classCandidates = context.getNodesByName(typeName);
-
-  for (const classNode of classCandidates) {
-    if (classNode.kind !== 'class' && classNode.kind !== 'struct' && classNode.kind !== 'interface') {
-      continue;
-    }
-    if (classNode.language !== ref.language) continue;
-
-    const nodesInFile = context.getNodesInFile(classNode.filePath);
-    const methodNode = nodesInFile.find(
-      (n) =>
-        n.kind === 'method' &&
-        n.name === methodName &&
-        n.qualifiedName.includes(classNode.name)
-    );
-
-    if (methodNode) {
+  // Look up methods by name and match by qualifiedName ending in
+  // `<typeName>::<methodName>`. This works whether the method is defined
+  // in-class (`class Foo { int bar() { ... } }`) or out-of-line in a separate
+  // file (`int Foo::bar() { ... }` in foo.cpp while class Foo is in foo.hpp).
+  // The previous same-file approach missed the latter — the typical C++ layout.
+  const methodCandidates = context.getNodesByName(methodName);
+  const want = `${typeName}::${methodName}`;
+  for (const m of methodCandidates) {
+    if (m.kind !== 'method') continue;
+    if (m.language !== ref.language) continue;
+    const qn = m.qualifiedName;
+    if (qn === want || qn.endsWith(`::${want}`)) {
       return {
         original: ref,
-        targetNodeId: methodNode.id,
+        targetNodeId: m.id,
         confidence,
         resolvedBy,
       };
@@ -182,6 +177,15 @@ function resolveMethodOnType(
 
   return null;
 }
+
+// C++ keywords/control-flow tokens that can appear right before a receiver
+// (e.g. `return ptr->m()`) and must NOT be treated as a type.
+const CPP_NON_TYPE_TOKENS = new Set([
+  'return', 'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'default',
+  'break', 'continue', 'goto', 'throw', 'new', 'delete', 'co_await', 'co_yield',
+  'co_return', 'static_cast', 'const_cast', 'dynamic_cast', 'reinterpret_cast',
+  'sizeof', 'alignof', 'typeid', 'and', 'or', 'not', 'xor',
+]);
 
 function normalizeCppTypeName(typeName: string): string | null {
   const normalized = typeName
@@ -193,7 +197,21 @@ function normalizeCppTypeName(typeName: string): string | null {
 
   if (!normalized) return null;
   const parts = normalized.split(/::/).filter(Boolean);
-  return parts[parts.length - 1] ?? null;
+  const last = parts[parts.length - 1];
+  if (!last) return null;
+  if (CPP_NON_TYPE_TOKENS.has(last)) return null;
+  return last;
+}
+
+// Declarator regex: matches `Type receiver`, `Type* receiver`, `Type *receiver`,
+// `Type*receiver`, `Type<X> receiver`, etc., REQUIRING a declarator terminator
+// (`;`, `=`, `,`, `)`, `[`, `{`, `(`, or end-of-line) after the receiver. The
+// terminator rules out uses like `return receiver->m()` where the preceding
+// token is a keyword, not a type.
+function buildDeclaratorRegex(escapedReceiver: string): RegExp {
+  return new RegExp(
+    `([A-Za-z_][\\w:]*(?:\\s*<[^;=(){}]+>)?(?:\\s*[*&]+)?)\\s*\\b${escapedReceiver}\\b\\s*(?=[;=,)\\[{(]|$)`,
+  );
 }
 
 function inferCppReceiverType(
@@ -208,23 +226,15 @@ function inferCppReceiverType(
   const callLineIndex = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
   const escapedReceiver = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const receiverPattern = new RegExp(`\\b${escapedReceiver}\\b`);
+  const declaratorRegex = buildDeclaratorRegex(escapedReceiver);
 
   for (let i = callLineIndex; i >= 0; i--) {
     const line = lines[i];
     if (!line || !receiverPattern.test(line)) continue;
 
-    const declaratorMatch = line.match(
-      new RegExp(`([A-Za-z_][\\w:]*(?:\\s*<[^;=(){}]+>)?(?:\\s*[*&]+)?)\\s+${escapedReceiver}\\b`)
-    );
+    const declaratorMatch = line.match(declaratorRegex);
     if (declaratorMatch) {
       const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
-      if (normalized) return normalized;
-    }
-
-    const memberIndex = line.indexOf(receiverName);
-    if (memberIndex >= 0) {
-      const prefix = line.slice(0, memberIndex).trim();
-      const normalized = normalizeCppTypeName(prefix.replace(/\b(private|public|protected)\s*:?$/, '').trim());
       if (normalized) return normalized;
     }
   }
@@ -242,9 +252,7 @@ function inferCppReceiverType(
 
     for (const line of headerSource.split(/\r?\n/)) {
       if (!receiverPattern.test(line)) continue;
-      const declaratorMatch = line.match(
-        new RegExp(`([A-Za-z_][\\w:]*(?:\\s*<[^;=(){}]+>)?(?:\\s*[*&]+)?)\\s+${escapedReceiver}\\b`)
-      );
+      const declaratorMatch = line.match(declaratorRegex);
       if (!declaratorMatch) continue;
       const normalized = normalizeCppTypeName(declaratorMatch[1] ?? '');
       if (normalized) return normalized;
