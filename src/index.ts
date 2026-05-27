@@ -47,6 +47,7 @@ import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock } from './utils';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
+import { logDebug } from './errors';
 
 // Re-export types for consumers
 export * from './types';
@@ -321,8 +322,11 @@ export class CodeGraph {
     return this.indexMutex.withLock(async () => {
       try {
         this.fileLock.acquire();
-      } catch {
-        return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
+      } catch (err) {
+        const message = err instanceof Error
+          ? err.message
+          : 'Could not acquire file lock - another process may be indexing';
+        return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message, severity: 'error' as const }], durationMs: 0 };
       }
       try {
         const before = this.queries.getNodeAndEdgeCount();
@@ -393,8 +397,11 @@ export class CodeGraph {
     return this.indexMutex.withLock(async () => {
       try {
         this.fileLock.acquire();
-      } catch {
-        return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
+      } catch (err) {
+        const message = err instanceof Error
+          ? err.message
+          : 'Could not acquire file lock - another process may be indexing';
+        return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message, severity: 'error' as const }], durationMs: 0 };
       }
       try {
         return this.orchestrator.indexFiles(filePaths);
@@ -413,7 +420,11 @@ export class CodeGraph {
     return this.indexMutex.withLock(async () => {
       try {
         this.fileLock.acquire();
-      } catch {
+      } catch (err) {
+        logDebug('Skipping sync because file lock is unavailable', {
+          error: err instanceof Error ? err.message : String(err),
+          projectRoot: this.projectRoot,
+        });
         return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
       }
       try {

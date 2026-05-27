@@ -8,11 +8,12 @@
  * - Atomic writes
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { FileLock, validateProjectPath } from '../src/utils';
+import { setLogger, silentLogger, type Logger } from '../src/errors';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
@@ -32,13 +33,25 @@ function cleanupTempDir(dir: string): void {
 describe('FileLock', () => {
   let tempDir: string;
   let lockPath: string;
+  let logger: Logger;
+  let debugSpy: ReturnType<typeof vi.fn>;
+  let warnSpy: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     tempDir = createTempDir();
     lockPath = path.join(tempDir, 'test.lock');
+    debugSpy = vi.fn();
+    warnSpy = vi.fn();
+    logger = {
+      debug: debugSpy,
+      warn: warnSpy,
+      error: vi.fn(),
+    };
+    setLogger(logger);
   });
 
   afterEach(() => {
+    setLogger(silentLogger);
     cleanupTempDir(tempDir);
   });
 
@@ -47,8 +60,16 @@ describe('FileLock', () => {
     lock.acquire();
 
     expect(fs.existsSync(lockPath)).toBe(true);
-    const content = fs.readFileSync(lockPath, 'utf-8').trim();
-    expect(parseInt(content, 10)).toBe(process.pid);
+    const content = JSON.parse(fs.readFileSync(lockPath, 'utf-8')) as {
+      pid: number;
+      token: string;
+      createdAt: number;
+      hostname: string;
+    };
+    expect(content.pid).toBe(process.pid);
+    expect(content.token).toEqual(expect.any(String));
+    expect(content.createdAt).toEqual(expect.any(Number));
+    expect(content.hostname).toEqual(expect.any(String));
 
     lock.release();
     expect(fs.existsSync(lockPath)).toBe(false);
@@ -60,20 +81,33 @@ describe('FileLock', () => {
 
     lock1.acquire();
 
-    // Second lock should fail because our PID is alive
-    expect(() => lock2.acquire()).toThrow(/locked by another process/);
+    expect(() => lock2.acquire()).toThrow(/locked by another process \(PID/);
 
     lock1.release();
   });
 
   it('should detect and remove stale locks from dead processes', () => {
-    // Write a lock file with a PID that doesn't exist
-    // PID 99999999 is extremely unlikely to be a real process
     fs.writeFileSync(lockPath, '99999999');
 
     const lock = new FileLock(lockPath);
-    // Should succeed because the PID is dead
     expect(() => lock.acquire()).not.toThrow();
+    expect(debugSpy).toHaveBeenCalledWith(
+      'Removing stale lock from dead process',
+      expect.objectContaining({ lockPath, pid: 99999999 })
+    );
+
+    lock.release();
+  });
+
+  it('should remove unreadable lock files before acquiring', () => {
+    fs.writeFileSync(lockPath, '{bad json');
+
+    const lock = new FileLock(lockPath);
+    expect(() => lock.acquire()).not.toThrow();
+    expect(warnSpy).toHaveBeenCalledWith(
+      'Removing unreadable lock file before reacquiring',
+      expect.objectContaining({ lockPath })
+    );
 
     lock.release();
   });
@@ -130,8 +164,92 @@ describe('FileLock', () => {
     const lock = new FileLock(lockPath);
     lock.acquire();
     lock.release();
-    // Second release should not throw
     expect(() => lock.release()).not.toThrow();
+  });
+
+  it('should not remove a lock it no longer owns', () => {
+    const lock = new FileLock(lockPath);
+    lock.acquire();
+    const current = JSON.parse(fs.readFileSync(lockPath, 'utf-8')) as {
+      pid: number;
+      token: string;
+      createdAt: number;
+      hostname: string;
+    };
+    fs.writeFileSync(lockPath, JSON.stringify({ ...current, token: 'different-token' }));
+
+    lock.release();
+
+    expect(fs.existsSync(lockPath)).toBe(true);
+  });
+});
+
+describe('CodeGraph lock error propagation', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+  let lockPath: string;
+
+  beforeEach(() => {
+    testDir = createTempDir();
+    fs.writeFileSync(path.join(testDir, 'example.ts'), 'export const value = 1;\n');
+    cg = CodeGraph.initSync(testDir);
+    lockPath = path.join(testDir, '.codegraph', 'codegraph.lock');
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    cleanupTempDir(testDir);
+  });
+
+  it('indexAll should return the specific file lock error', async () => {
+    fs.writeFileSync(lockPath, JSON.stringify({
+      pid: process.pid,
+      token: 'held-by-other',
+      createdAt: Date.now() - 1234,
+      hostname: 'test-host',
+    }));
+
+    const result = await cg.indexAll();
+
+    expect(result.success).toBe(false);
+    expect(result.errors[0]?.message ?? '').toContain('PID');
+    expect(result.errors[0]?.message ?? '').toContain(lockPath);
+    expect(result.errors[0]?.message ?? '').toContain('test-host');
+  });
+
+  it('indexFiles should return the specific file lock error', async () => {
+    fs.writeFileSync(lockPath, JSON.stringify({
+      pid: process.pid,
+      token: 'held-by-other',
+      createdAt: Date.now() - 567,
+      hostname: 'test-host',
+    }));
+
+    const result = await cg.indexFiles([path.join(testDir, 'example.ts')]);
+
+    expect(result.success).toBe(false);
+    expect(result.errors[0]?.message ?? '').toContain('PID');
+    expect(result.errors[0]?.message ?? '').toContain(lockPath);
+  });
+
+  it('sync should preserve the zero-result sentinel on lock contention', async () => {
+    fs.writeFileSync(lockPath, JSON.stringify({
+      pid: process.pid,
+      token: 'held-by-other',
+      createdAt: Date.now() - 250,
+      hostname: 'test-host',
+    }));
+
+    const result = await cg.sync();
+
+    expect(result).toEqual({
+      filesChecked: 0,
+      filesAdded: 0,
+      filesModified: 0,
+      filesRemoved: 0,
+      nodesUpdated: 0,
+      durationMs: 0,
+    });
   });
 });
 

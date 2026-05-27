@@ -31,6 +31,9 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
+import { randomUUID } from 'crypto';
+import { logDebug, logWarn } from './errors';
 
 // ============================================================
 // SECURITY UTILITIES
@@ -175,17 +178,25 @@ export function normalizePath(filePath: string): string {
 }
 
 /**
- * Cross-process file lock using a lock file with PID tracking.
+ * Cross-process file lock using a lock file with explicit ownership metadata.
  *
  * Prevents multiple processes (e.g., git hooks, CLI, MCP server) from
  * writing to the same database simultaneously.
  */
+interface FileLockInfo {
+  pid: number;
+  token?: string;
+  createdAt?: number;
+  hostname?: string;
+}
+
 export class FileLock {
   private lockPath: string;
   private held = false;
+  private token: string | null = null;
+  private acquiredAtMs: number | null = null;
 
-  /** Locks older than this are considered stale regardless of PID status */
-  private static readonly STALE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
+  private static readonly WARN_HOLD_MS = 30_000;
 
   constructor(lockPath: string) {
     this.lockPath = lockPath;
@@ -195,44 +206,39 @@ export class FileLock {
    * Acquire the lock. Throws if the lock is held by another live process.
    */
   acquire(): void {
-    // Check for existing lock
     if (fs.existsSync(this.lockPath)) {
-      try {
-        const content = fs.readFileSync(this.lockPath, 'utf-8').trim();
-        const pid = parseInt(content, 10);
-        const stat = fs.statSync(this.lockPath);
-        const lockAge = Date.now() - stat.mtimeMs;
-
-        // Treat locks older than the timeout as stale, regardless of PID
-        if (lockAge < FileLock.STALE_TIMEOUT_MS && !isNaN(pid) && this.isProcessAlive(pid)) {
-          throw new Error(
-            `CodeGraph database is locked by another process (PID ${pid}). ` +
-            `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
-          );
+      const existing = this.readLockInfo();
+      if (existing) {
+        if (this.isProcessAlive(existing.pid)) {
+          throw new Error(this.buildLockedMessage(existing));
         }
-
-        // Stale lock (dead process or timed out) - remove it
-        fs.unlinkSync(this.lockPath);
-      } catch (err) {
-        if (err instanceof Error && err.message.includes('locked by another')) {
-          throw err;
-        }
-        // Other errors reading lock file - try to remove it
-        try { fs.unlinkSync(this.lockPath); } catch { /* ignore */ }
+        this.removeLockFile('Removing stale lock from dead process', existing, 'debug');
+      } else {
+        this.removeLockFile('Removing unreadable lock file before reacquiring', null, 'warn');
       }
     }
 
-    // Write our PID to the lock file using exclusive create flag
+    const token = randomUUID();
+    const info: FileLockInfo = {
+      pid: process.pid,
+      token,
+      createdAt: Date.now(),
+      hostname: os.hostname(),
+    };
+
     try {
-      fs.writeFileSync(this.lockPath, String(process.pid), { flag: 'wx' });
+      fs.writeFileSync(this.lockPath, JSON.stringify(info), { flag: 'wx' });
       this.held = true;
+      this.token = token;
+      this.acquiredAtMs = info.createdAt;
+      logDebug('Acquired file lock', {
+        lockPath: this.lockPath,
+        pid: process.pid,
+      });
     } catch (err: any) {
       if (err.code === 'EEXIST') {
-        // Race condition: another process grabbed the lock between our check and write
-        throw new Error(
-          'CodeGraph database is locked by another process. ' +
-          `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
-        );
+        const existing = this.readLockInfo();
+        throw new Error(existing ? this.buildLockedMessage(existing) : this.buildLockedMessage());
       }
       throw err;
     }
@@ -244,15 +250,26 @@ export class FileLock {
   release(): void {
     if (!this.held) return;
     try {
-      // Only remove if we still own it (check PID)
-      const content = fs.readFileSync(this.lockPath, 'utf-8').trim();
-      if (parseInt(content, 10) === process.pid) {
+      const info = this.readLockInfo();
+      if (this.ownsLock(info)) {
         fs.unlinkSync(this.lockPath);
       }
     } catch {
       // Lock file already gone - that's fine
+    } finally {
+      if (this.acquiredAtMs !== null) {
+        const heldMs = Date.now() - this.acquiredAtMs;
+        const context = { lockPath: this.lockPath, pid: process.pid, heldMs };
+        if (heldMs >= FileLock.WARN_HOLD_MS) {
+          logWarn('Released file lock after long hold', context);
+        } else {
+          logDebug('Released file lock', context);
+        }
+      }
+      this.held = false;
+      this.token = null;
+      this.acquiredAtMs = null;
     }
-    this.held = false;
   }
 
   /**
@@ -276,6 +293,71 @@ export class FileLock {
       return await fn();
     } finally {
       this.release();
+    }
+  }
+
+  private readLockInfo(): FileLockInfo | null {
+    try {
+      const content = fs.readFileSync(this.lockPath, 'utf-8').trim();
+      if (!content) return null;
+      const legacyPid = parseInt(content, 10);
+      if (!Number.isNaN(legacyPid) && String(legacyPid) === content) {
+        const stat = fs.statSync(this.lockPath);
+        return { pid: legacyPid, createdAt: Number.isFinite(stat.mtimeMs) ? stat.mtimeMs : undefined };
+      }
+      const parsed = safeJsonParse<Partial<FileLockInfo> | null>(content, null);
+      if (!parsed || typeof parsed !== 'object' || typeof parsed.pid !== 'number') {
+        return null;
+      }
+      return {
+        pid: parsed.pid,
+        token: typeof parsed.token === 'string' ? parsed.token : undefined,
+        createdAt: typeof parsed.createdAt === 'number' ? parsed.createdAt : undefined,
+        hostname: typeof parsed.hostname === 'string' ? parsed.hostname : undefined,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private ownsLock(info: FileLockInfo | null): boolean {
+    if (!info || info.pid !== process.pid) return false;
+    if (!info.token) return true;
+    return info.token === this.token;
+  }
+
+  private buildLockedMessage(info?: FileLockInfo | null): string {
+    if (!info) {
+      return 'CodeGraph database is locked by another process. ' +
+        `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`;
+    }
+    const details = [`PID ${info.pid}`];
+    if (info.hostname) details.push(`host ${info.hostname}`);
+    if (typeof info.createdAt === 'number') {
+      details.push(`held for ${Math.max(0, Date.now() - info.createdAt)}ms`);
+    }
+    return `CodeGraph database is locked by another process (${details.join(', ')}). ` +
+      `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`;
+  }
+
+  private removeLockFile(message: string, info: FileLockInfo | null, level: 'debug' | 'warn'): void {
+    const context: Record<string, unknown> = { lockPath: this.lockPath };
+    if (info) {
+      context.pid = info.pid;
+      if (info.hostname) context.hostname = info.hostname;
+      if (typeof info.createdAt === 'number') {
+        context.ageMs = Math.max(0, Date.now() - info.createdAt);
+      }
+    }
+    try {
+      fs.unlinkSync(this.lockPath);
+    } catch {
+      return;
+    }
+    if (level === 'warn') {
+      logWarn(message, context);
+    } else {
+      logDebug(message, context);
     }
   }
 
