@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock, validateProjectPath } from '../src/utils';
+import { FileLock, validatePathWithinRoot, validateProjectPath } from '../src/utils';
 import { setLogger, silentLogger, type Logger } from '../src/errors';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
@@ -667,6 +667,50 @@ describe('Symlink Cycle Detection', () => {
     // Should not throw
     const files = scanDirectory(tempDir);
     expect(files).toContain('src/valid.ts');
+  });
+});
+
+describe('Symlink path validation', () => {
+  let projectDir: string;
+  let outsideDir: string;
+  let insideLink: string;
+  let outsideFile: string;
+
+  beforeEach(() => {
+    projectDir = createTempDir();
+    outsideDir = createTempDir();
+    fs.mkdirSync(path.join(projectDir, 'src'));
+    outsideFile = path.join(outsideDir, 'secret.ts');
+    fs.writeFileSync(outsideFile, 'export const secret = "outside";\n');
+    insideLink = path.join(projectDir, 'src', 'secret-link.ts');
+  });
+
+  afterEach(() => {
+    cleanupTempDir(projectDir);
+    cleanupTempDir(outsideDir);
+  });
+
+  it('rejects symlinked files that resolve outside the project root', () => {
+    try {
+      fs.symlinkSync(outsideFile, insideLink);
+    } catch {
+      return;
+    }
+
+    expect(validatePathWithinRoot(projectDir, 'src/secret-link.ts')).toBeNull();
+  });
+
+  it('still allows symlinked files whose real target stays within the project root', () => {
+    const realFile = path.join(projectDir, 'src', 'real.ts');
+    fs.writeFileSync(realFile, 'export const safe = true;\n');
+
+    try {
+      fs.symlinkSync(realFile, insideLink);
+    } catch {
+      return;
+    }
+
+    expect(validatePathWithinRoot(projectDir, 'src/secret-link.ts')).toBe(path.join(projectDir, 'src', 'secret-link.ts'));
   });
 });
 

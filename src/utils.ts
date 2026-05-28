@@ -64,6 +64,11 @@ export function validatePathWithinRoot(projectRoot: string, filePath: string): s
   if (!resolved.startsWith(normalizedRoot + path.sep) && resolved !== normalizedRoot) {
     return null;
   }
+
+  if (!isPathWithinRootReal(filePath, projectRoot)) {
+    return null;
+  }
+
   return resolved;
 }
 
