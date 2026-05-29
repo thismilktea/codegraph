@@ -3393,6 +3393,37 @@ describe('Directory Exclusion', () => {
     expect(files[0]).toBe('src/components/Button.tsx');
     expect(files[0]).not.toContain('\\');
   });
+
+  it('should index tracked files under CJK directories in git repos (issue #541)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'cjk-root');
+    fs.mkdirSync(path.join(root, 'src', 'english'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'src', '中文目录'), { recursive: true });
+
+    git(root, 'init', '-q');
+    git(root, 'config', 'user.email', 'test@test.com');
+    git(root, 'config', 'user.name', 'Test');
+
+    fs.writeFileSync(
+      path.join(root, 'src', 'english', 'Foo.cs'),
+      'namespace Demo;\npublic class Foo { public void Bar() {} }\n'
+    );
+    fs.writeFileSync(
+      path.join(root, 'src', '中文目录', 'Baz.cs'),
+      'namespace Demo;\npublic class Baz { public void Qux() {} }\n'
+    );
+
+    git(root, 'add', '-A');
+    git(root, 'commit', '-q', '-m', 'cjk paths');
+
+    const files = scanDirectory(root);
+
+    expect(files).toContain('src/english/Foo.cs');
+    expect(files).toContain('src/中文目录/Baz.cs');
+  });
 });
 
 describe('Git Submodules', () => {

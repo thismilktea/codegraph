@@ -225,6 +225,41 @@ describe('Sync Module', () => {
       expect(nodes.length).toBeGreaterThan(0);
     });
 
+    it('should detect new untracked files under CJK directories via git', async () => {
+      fs.mkdirSync(path.join(testDir, 'src', '中文目录'), { recursive: true });
+      fs.writeFileSync(
+        path.join(testDir, 'src', '中文目录', 'new.ts'),
+        `export function cjkFunc() { return 42; }`
+      );
+
+      const result = await cg.sync();
+
+      expect(result.filesAdded).toBe(1);
+      expect(result.changedFilePaths).toContain('src/中文目录/new.ts');
+      expect(cg.searchNodes('cjkFunc').length).toBeGreaterThan(0);
+    });
+
+    it('should detect modified tracked files under CJK directories via git', async () => {
+      const cjkDir = path.join(testDir, 'src', '中文目录');
+      const filePath = path.join(cjkDir, 'tracked.ts');
+      fs.mkdirSync(cjkDir, { recursive: true });
+      fs.writeFileSync(filePath, `export function cjkTracked() { return 1; }`);
+      git('add', '-A');
+      git('commit', '-m', 'add cjk tracked file');
+      await cg.sync();
+
+      fs.writeFileSync(filePath, `export function renamedCjkTracked() { return 7; }`);
+
+      const changes = cg.getChangedFiles();
+      expect(changes.modified).toContain('src/中文目录/tracked.ts');
+
+      const result = await cg.sync();
+      expect(result.filesModified).toBe(1);
+      expect(result.changedFilePaths).toContain('src/中文目录/tracked.ts');
+      expect(cg.searchNodes('renamedCjkTracked').length).toBeGreaterThan(0);
+      expect(cg.searchNodes('cjkTracked').length).toBeGreaterThan(0);
+    });
+
     it('should stop reporting untracked files once they are indexed (issue #206)', async () => {
       // Untracked files stay `??` in git status even after codegraph indexes
       // them. Change detection must compare them against the DB by hash, not

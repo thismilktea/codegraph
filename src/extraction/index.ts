@@ -198,32 +198,32 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>): v
   // Without this, monorepos using submodules index 0 files. (See issue #147.)
   // Note: --recurse-submodules only supports -c/--cached and --stage modes — it
   // can't be combined with -o, so untracked files are gathered separately below.
-  const tracked = execFileSync('git', ['ls-files', '-c', '--recurse-submodules'], gitOpts);
-  for (const line of tracked.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed) {
-      files.add(normalizePath(prefix + trimmed));
+  const tracked = execFileSync('git', ['ls-files', '-z', '-c', '--recurse-submodules'], gitOpts);
+  for (const entry of tracked.split('\0')) {
+    const filePath = entry.trim();
+    if (filePath) {
+      files.add(normalizePath(prefix + filePath));
     }
   }
 
   // Untracked files (submodules manage their own untracked state). Embedded git
   // repos surface here as a single "subdir/" entry that git refuses to descend
   // into — recurse into those as their own repos so their source gets indexed.
-  const untracked = execFileSync('git', ['ls-files', '-o', '--exclude-standard'], gitOpts);
-  for (const line of untracked.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (trimmed.endsWith('/')) {
+  const untracked = execFileSync('git', ['ls-files', '-z', '-o', '--exclude-standard'], gitOpts);
+  for (const entry of untracked.split('\0')) {
+    const filePath = entry.trim();
+    if (!filePath) continue;
+    if (filePath.endsWith('/')) {
       // git only emits a trailing-slash directory entry for an embedded repo.
       // Guard with a .git check anyway, and skip anything else exactly as git
       // itself skips it (we never descend into a non-repo opaque dir).
-      const childDir = path.join(repoDir, trimmed);
+      const childDir = path.join(repoDir, filePath);
       if (fs.existsSync(path.join(childDir, '.git'))) {
-        collectGitFiles(childDir, prefix + trimmed, files);
+        collectGitFiles(childDir, prefix + filePath, files);
       }
       continue;
     }
-    files.add(normalizePath(prefix + trimmed));
+    files.add(normalizePath(prefix + filePath));
   }
 }
 
@@ -290,7 +290,7 @@ function getGitChangedFiles(rootDir: string): GitChanges | null {
   try {
     const output = execFileSync(
       'git',
-      ['status', '--porcelain', '--no-renames'],
+      ['status', '--porcelain', '-z', '--no-renames'],
       { cwd: rootDir, encoding: 'utf-8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
     );
 
@@ -298,11 +298,11 @@ function getGitChangedFiles(rootDir: string): GitChanges | null {
     const added: string[] = [];
     const deleted: string[] = [];
 
-    for (const line of output.split('\n')) {
-      if (line.length < 4) continue; // Minimum: "XY file"
+    for (const entry of output.split('\0')) {
+      if (entry.length < 4) continue; // Minimum: "XY file"
 
-      const statusCode = line.substring(0, 2);
-      const filePath = normalizePath(line.substring(3));
+      const statusCode = entry.substring(0, 2);
+      const filePath = normalizePath(entry.substring(3));
 
       // Skip non-source files (git status already omits .gitignored paths).
       if (!isSourceFile(filePath)) continue;
